@@ -1,0 +1,10 @@
+mss
+opencv-python
+numpy
+pynput
+transformers
+torch
+Pillow
+flask
+requests
+pywin32
