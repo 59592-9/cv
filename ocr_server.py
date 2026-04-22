@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-TrOCR 常驻 HTTP 服务
+PaddleOCR 常驻 HTTP 服务
 
 启动后模型常驻 GPU 显存，通过 HTTP API 接收图片并返回识别结果。
 支持 base64 JSON 和 multipart/form-data 两种上传方式。
 
 用法:
-    python ocr_server.py                    # 默认 GPU 模式，端口 5000
+    python ocr_server.py                    # 默�� GPU 模式，端口 5000
     python ocr_server.py --port 8080        # 指定端口
     python ocr_server.py --cpu              # CPU 模式
 
 优化点：
+- 使用 PaddleOCR（PP-OCRv4 英文数字模型），对小区域纯数字识别更准确
 - 使用 logging 模块统一日志输出
 - 增加请求体大小限制，防止超大图片打爆内存
 - 增加 /metrics 端点，暴露识别次数与平均耗时
@@ -52,11 +53,9 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 # ------------------------------------------------------------------
 # 全局状态
 # ------------------------------------------------------------------
-_processor = None
-_model = None
-_device = None
-_Image = None
-_infer_lock = threading.Lock()   # 推理互斥锁，防止并发推理显存溢出
+_ocr = None                          # PaddleOCR 实例
+_use_gpu: bool = True
+_infer_lock = threading.Lock()       # 推理互斥锁，防止并发推理显存溢出
 _start_time: float = 0.0
 
 # 滑动窗口统计（最近 1000 次请求的耗时，单位 ms）
@@ -72,76 +71,136 @@ _stats_lock = threading.Lock()
 
 def init_model(use_gpu: bool = True) -> None:
     """
-    初始化 TrOCR 模型并加载到指定设备。
+    初始化 PaddleOCR 模型并加载到指定设备。
 
     Args:
         use_gpu: 是否优先使用 GPU
     """
-    global _processor, _model, _device, _Image, _start_time
+    global _ocr, _use_gpu, _start_time
 
-    import torch
-    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-    from PIL import Image as PILImage
+    from paddleocr import PaddleOCR
 
-    _Image = PILImage
+    _use_gpu = use_gpu
+    logger.info("正在加载 PaddleOCR PP-OCRv5（device=%s）...", "gpu" if use_gpu else "cpu")
 
-    if use_gpu and torch.cuda.is_available():
-        _device = torch.device("cuda")
-        logger.info("使用 GPU: %s", torch.cuda.get_device_name(0))
-    else:
-        _device = torch.device("cpu")
-        if use_gpu:
-            logger.warning("GPU 不可用，回退到 CPU 模式")
-        else:
-            logger.info("使用 CPU 模式")
-
-    model_name = "microsoft/trocr-base-printed"
-    logger.info("加载模型: %s", model_name)
-
-    _processor = TrOCRProcessor.from_pretrained(model_name)
-    _model = VisionEncoderDecoderModel.from_pretrained(model_name)
-    _model.to(_device)
-    _model.eval()
-
-    if _device.type == "cuda":
-        import torch as _torch
-        mem = _torch.cuda.memory_allocated() / 1024 / 1024
-        logger.info("GPU 显存占用: %.0f MB", mem)
+    # PP-OCRv5 模型配置：
+    #   text_detection_model_name:    PP-OCRv5_server_det  （高精度检测）
+    #   text_recognition_model_name:  en_PP-OCRv5_mobile_rec（英文数字识别）
+    # use_textline_orientation=False 关闭行方向分类，加快推理速度
+    # enable_mkldnn=False 禁用 oneDNN，避免兼容性问题（CPU 模式下有效）
+    # device="gpu"/"cpu" 为 PaddleOCR 3.x 新版设备参数
+    _ocr = PaddleOCR(
+        text_detection_model_name="PP-OCRv5_server_det",
+        text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+        use_textline_orientation=False,
+        device="gpu" if use_gpu else "cpu",
+        enable_mkldnn=False,
+    )
 
     _start_time = time.time()
-    logger.info("模型加载完成！")
+    logger.info("PaddleOCR 模型加载完成！")
+
+    # GPU Warm-up：用一张空白图片做一次推理，触发 CUDA 内核编译和显存分配
+    # 这样用户第一次请求时不会遇到 ~5000ms 的冷启动延迟
+    logger.info("正在执行 GPU Warm-up 推理...")
+    t_warmup = time.time()
+    try:
+        dummy = np.ones((64, 200, 3), dtype=np.uint8) * 200  # 浅灰色空白图
+        _ocr.ocr(dummy)
+        logger.info("GPU Warm-up 完成，耗时 %.2f 秒", time.time() - t_warmup)
+    except Exception as exc:
+        logger.warning("GPU Warm-up 失败（不影响正��使用）: %s", exc)
+
+
+# ------------------------------------------------------------------
+# 图像预处理
+# ------------------------------------------------------------------
+
+def _preprocess(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    图像预处理：自动检测深色背景并反色，放大至目标高度，锐化文字边缘。
+
+    处理流程：
+        1. 若图像平均亮度 < 128，判定为深色背景，执行反色
+        2. 若图像高度 < 128px，按比例放大至 128px（最大放大 8x）
+        3. 放大后做 Unsharp Mask 锐化，恢复文字边缘清晰度
+
+    Args:
+        img_bgr: BGR 格式原始图像
+
+    Returns:
+        预处理后的 BGR 图像
+    """
+    # 1. 深色背景检测与反色
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    mean_brightness = float(gray.mean())
+    if mean_brightness < 128:
+        img_bgr = cv2.bitwise_not(img_bgr)
+        logger.debug("检测到深色背景（亮度=%.1f），已执行反色", mean_brightness)
+
+    # 2. 小图放大（目标高度 128px，最大放大 8x）
+    h, w = img_bgr.shape[:2]
+    if h < 128:
+        scale = min(128.0 / h, 8.0)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        logger.debug("小图放大 %.1fx: %dx%d → %dx%d", scale, w, h, new_w, new_h)
+
+        # 3. Unsharp Mask 锐化：增强放大后的文字边缘
+        blurred = cv2.GaussianBlur(img_bgr, (0, 0), sigmaX=1.5)
+        img_bgr = cv2.addWeighted(img_bgr, 1.8, blurred, -0.8, 0)
+
+    return img_bgr
 
 
 # ------------------------------------------------------------------
 # 推理核心
 # ------------------------------------------------------------------
 
-def _recognize_text(img_bgr: np.ndarray) -> str:
+def _recognize_text(img_bgr: np.ndarray) -> tuple:
     """
-    使用 TrOCR 识别图片中的文字（线程安全）。
+    使用 PaddleOCR 识别图片中的文字（线程安全）。
 
     Args:
         img_bgr: BGR 格式的 numpy 数组
 
     Returns:
-        识别出的原始文本字符串
+        (raw_text, number) 元组
+        - raw_text: 所有识别片段拼接的原始文本
+        - number:   从文本中提取的整数，未识别到返回 -1
     """
-    import torch
+    # 预处理：反色 + 小图放大 + 锐化
+    img_bgr = _preprocess(img_bgr)
 
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil_image = _Image.fromarray(img_rgb)
-
-    pixel_values = _processor(
-        images=pil_image,
-        return_tensors="pt",
-    ).pixel_values.to(_device)
-
+    # PaddleOCR 3.x: ocr() 等同于 predict()，返回 list[OCRResult]
+    # OCRResult 是类字典对象，文本在 rec_texts，置信度在 rec_scores
     with _infer_lock:
-        with torch.no_grad():
-            generated_ids = _model.generate(pixel_values)
+        result = _ocr.ocr(img_bgr)
 
-    text = _processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return text.strip()
+    if not result:
+        return "", -1
+
+    ocr_res = result[0]  # 第一张图的结果，OCRResult 对象
+    rec_texts = ocr_res.get("rec_texts", [])
+    rec_scores = ocr_res.get("rec_scores", [])
+
+    if not rec_texts:
+        return "", -1
+
+    texts = []
+    for text, confidence in zip(rec_texts, rec_scores):
+        if confidence >= 0.5:
+            texts.append(text)
+            logger.debug("识别片段: '%s' (置信度: %.2f)", text, confidence)
+
+    raw_text = " ".join(texts)
+
+    # 提取数字
+    digits = re.findall(r"\d+", raw_text)
+    number = int("".join(digits)) if digits else -1
+
+    return raw_text, number
 
 
 def _decode_image_from_b64(b64_str: str) -> Optional[np.ndarray]:
@@ -213,8 +272,9 @@ def health():
 
     return jsonify({
         "status": "ok",
-        "gpu": str(_device) if _device else "unknown",
-        "model_loaded": _model is not None,
+        "engine": "PaddleOCR",
+        "gpu": _use_gpu,
+        "model_loaded": _ocr is not None,
         "uptime_seconds": round(uptime, 1),
         "total_requests": total,
         "failed_requests": failed,
@@ -278,7 +338,7 @@ def recognize():
             time_ms   (float) - 本次请求耗时（毫秒）
             error     (str)   - 错误信息（仅失败时存在）
     """
-    if _model is None:
+    if _ocr is None:
         return jsonify({
             "success": False,
             "number": -1,
@@ -329,11 +389,7 @@ def recognize():
             }), 422
 
         # 执行识别
-        raw_text = _recognize_text(img)
-
-        # 提取数字
-        digits = re.findall(r"\d+", raw_text)
-        number = int("".join(digits)) if digits else -1
+        raw_text, number = _recognize_text(img)
 
         elapsed_ms = (time.perf_counter() - t_start) * 1000
         _update_stats(elapsed_ms, success=True)
@@ -373,7 +429,7 @@ def request_entity_too_large(_):
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="TrOCR 常驻 HTTP 服务")
+    parser = argparse.ArgumentParser(description="PaddleOCR 常驻 HTTP 服务")
     parser.add_argument(
         "--port", type=int, default=5000, help="服务端口（默认 5000）"
     )
@@ -386,7 +442,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print("=" * 50)
-    print("  TrOCR 常驻 HTTP 服务")
+    print("  PaddleOCR 常驻 HTTP 服务")
     print("=" * 50)
 
     init_model(use_gpu=not args.cpu)

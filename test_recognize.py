@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-数字识别测试脚本 - TrOCR 版本
+数字识别测试脚本 - PaddleOCR PP-OCRv5 版本
 
 用法:
     python test_recognize.py <图片路径>                                  # 本地 GPU 模式
@@ -75,7 +75,7 @@ def test_recognize(
     else:
         mode_desc = "本地 CPU 模式"
 
-    _print_header("数字识别测试（TrOCR 引擎）")
+    _print_header("数字识别测试（PaddleOCR 引擎）")
     print(f"  输入图片: {image_path}")
     print(f"  运行模式: {mode_desc}")
     print(f"  重复次数: {repeat}")
@@ -84,7 +84,7 @@ def test_recognize(
     # ------------------------------------------------------------------
     # 步骤1：初始化引擎
     # ------------------------------------------------------------------
-    _print_section("步骤1", "初始化 TrOCR 引擎")
+    _print_section("步骤1", "初始化 PaddleOCR 引擎")
 
     t_init = time.perf_counter()
     try:
@@ -105,7 +105,7 @@ def test_recognize(
     # ------------------------------------------------------------------
     # 步骤2：执行识别（支持多次重复）
     # ------------------------------------------------------------------
-    _print_section("步骤2", f"执行 TrOCR 识别（共 {repeat} 次）")
+    _print_section("步骤2", f"执行 PaddleOCR 识别（共 {repeat} 次）")
 
     results: List[int] = []
     raw_texts: List[str] = []
@@ -204,7 +204,7 @@ def _print_section(step: str, desc: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="TrOCR 数字识别测试",
+        description="PaddleOCR PP-OCRv5 数字识别测试",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:

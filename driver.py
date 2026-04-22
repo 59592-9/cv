@@ -65,10 +65,10 @@ class MouseDriver:
 
     def move_and_click(self, x: int, y: int) -> bool:
         """
-        移动鼠标到指定坐标并执行单击操作。
+        移动鼠标到指定坐标并执行左键单击。
 
-        当前为模拟实现，通过 time.sleep 模拟硬件延迟。
-        后续可替换为真实的串口通信代码，发送移动和点击指令到外部硬件设备。
+        使用 pynput 实现真实鼠标控制。
+        后续可替换为串口通信代码（KmBox / 罗技驱动等）。
 
         Args:
             x: 目标点击位置的屏幕 X 坐标
@@ -81,38 +81,23 @@ class MouseDriver:
             return False
 
         try:
-            self._click_count += 1
-            logger.info(
-                "模拟硬件点击坐标: (%d, %d)（第 %d 次）", x, y, self._click_count
-            )
-            print(f"[MouseDriver] 模拟硬件点击坐标: ({x}, {y})")
+            from pynput.mouse import Button, Controller as MouseController
+            mouse = MouseController()
 
-            # 模拟鼠标移动延迟（真实硬件中为串口发送移动指令的耗时）
+            self._click_count += 1
+            logger.info("点击坐标: (%d, %d)（第 %d 次）", x, y, self._click_count)
+
+            # 移动到目标位置
+            mouse.position = (x, y)
             time.sleep(0.05)
 
-            # 模拟按下持续时间，随机 30~80 ms，模拟真实人类点击行为
+            # 按下并释放左键
             press_duration = random.uniform(0.03, 0.08)
-            logger.debug("鼠标按下，持续 %.0f ms", press_duration * 1000)
-            print("[MouseDriver] 鼠标按下")
+            mouse.press(Button.left)
             time.sleep(press_duration)
+            mouse.release(Button.left)
 
-            print("[MouseDriver] 鼠标抬起")
-            logger.debug("鼠标抬起，点击完成")
-
-            # TODO: 后续替换为真实串口通信代码
-            # 示例 (KmBox):
-            #   self._connection.write(f"mouse_move({x},{y})\n".encode())
-            #   time.sleep(0.05)
-            #   self._connection.write(b"mouse_down(1)\n")
-            #   time.sleep(random.uniform(0.03, 0.08))
-            #   self._connection.write(b"mouse_up(1)\n")
-            #
-            # 示例 (罗技驱动):
-            #   ghub.mouse_move(x, y)
-            #   ghub.mouse_down(1)
-            #   time.sleep(random.uniform(0.03, 0.08))
-            #   ghub.mouse_up(1)
-
+            logger.debug("点击完成 (%d, %d)", x, y)
             return True
 
         except Exception as exc:

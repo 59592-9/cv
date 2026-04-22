@@ -1,373 +1,350 @@
 # -*- coding: utf-8 -*-
 """
-主控逻辑模块 (Sniper Bot)
+main.py  -  工作流自动化工具主入口
 
-本模块为"极速价格识别与自动点击"系统的主控入口。
-核心流程：截屏 → TrOCR 价格识别 → 条件判定 → 自动点击购买。
-支持 F9 热键安全退出。
-
-识别引擎：TrOCR（微软 Vision Transformer，高准确率，支持 GPU 加速）
-支持本地模式（直接加载模型）和服务模式（HTTP 调用 ocr_server.py）
-
-优化点：
-- 配置集中到 BotConfig 数据类，便于外部修改和单元测试
-- 增加运行统计（总帧数、触发次数、平均识别耗时）
-- 购买后可配置最大触发次数，防止无限重复购买
-- 使用 logging 模块统一日志，支持日志级别控制
-- 线程安全的停止标志（threading.Event）
-- 主循环异常计数，连续异常超阈值时自动退出，避免死循环
+WorkflowApp 主窗口布局：
+  ┌─────────────────────────────────────────────────────┐
+  │  工具箱 (左)  │  工作流画布 (中)  │  控制区 (右)    │
+  ├───────────────┴──────────────────┴──────────────────┤
+  │                   运行日志 (底部)                    │
+  └─────────────────────────────────────────────────────┘
 """
 
+from __future__ import annotations
+
 import logging
-import threading
-import time
-from dataclasses import dataclass, field
-from typing import Optional
+import tkinter as tk
+from tkinter import messagebox
 
-from pynput import keyboard
-
-from vision import VisionEngine
+from selector_backend import OcrBackend
 from driver import MouseDriver
+from workflow_steps import StepType, make_step
+from workflow_engine import WorkflowEngine
+from workflow_ui import (
+    ToolboxPanel,
+    WorkflowCanvas,
+    LogPanel,
+    CLR_BG, CLR_PANEL, CLR_CARD, CLR_ACCENT,
+    CLR_GREEN, CLR_RED, CLR_TEXT, CLR_SUBTEXT, CLR_BORDER,
+    FONT_TITLE, FONT_NORMAL, FONT_SMALL,
+)
 
-# ------------------------------------------------------------------
-# 日志配置
-# ------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
 )
-logger = logging.getLogger("SniperBot")
+logger = logging.getLogger("WorkflowApp")
 
 
-# ------------------------------------------------------------------
-# 配置数据类
-# ------------------------------------------------------------------
+# ======================================================================
+# WorkflowApp  —  主窗口
+# ======================================================================
 
-@dataclass
-class BotConfig:
+class WorkflowApp:
     """
-    狙击机器人运行配置。
+    工作流自动化工具主窗口。
 
-    将所有可调参数集中在此处，方便修改和测试。
-    """
-
-    # 目标触发价格（当识别价格 <= 此值时触发购买）
-    target_price: int = 150_000
-
-    # 价格识别区域（mss 格式）
-    price_region: dict = field(default_factory=lambda: {
-        "top": 400,
-        "left": 800,
-        "width": 200,
-        "height": 50,
-    })
-
-    # 购买按钮的屏幕物理坐标 (x, y)
-    buy_button_pos: tuple = (960, 600)
-
-    # 目标帧率（每秒识别次数）
-    # TrOCR GPU 模式下单次推理约 50~200ms，2 FPS 即可满足 3 秒响应需求
-    target_fps: float = 2.0
-
-    # OCR 服务地址（None=本地模式，设置 URL=服务模式）
-    # 服务模式需先启动: python ocr_server.py
-    ocr_server_url: Optional[str] = None
-
-    # 是否使用 GPU（本地模式下有效）
-    use_gpu: bool = True
-
-    # 购买后冷却时间（秒），防止重复触发
-    buy_cooldown: float = 2.0
-
-    # 最大购买次数（0 = 不限制）
-    max_buy_count: int = 0
-
-    # 连续异常帧数阈值，超过后自动退出主循环
-    max_consecutive_errors: int = 10
-
-
-# ------------------------------------------------------------------
-# 主控类
-# ------------------------------------------------------------------
-
-class SniperBot:
-    """
-    狙击机器人主控类
-
-    负责协调视觉引擎和鼠标驱动，实现价格监控与自动购买逻辑。
-    当识别到的价格低于或等于目标价格时，自动触发点击购买操作。
+    组装 ToolboxPanel + WorkflowCanvas + LogPanel，
+    并管理 WorkflowEngine 的生命周期。
     """
 
-    def __init__(self, config: Optional[BotConfig] = None):
-        """
-        初始化狙击机器人。
+    def __init__(self):
+        self._engine: WorkflowEngine | None = None
 
-        Args:
-            config: 运行配置，None 时使用默认配置
-        """
-        self.config = config or BotConfig()
+        # 初始化后端（懒加载，首次执行时才真正加载模型）
+        self._ocr_backend: OcrBackend | None = None
+        self._mouse_driver: MouseDriver | None = None
 
-        # 线程安全的停止事件（比 bool 标志更可靠）
-        self._stop_event = threading.Event()
+        self._root = tk.Tk()
+        self._root.title("工作流自动化工具")
+        self._root.configure(bg=CLR_BG)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # 运行统计
-        self._stats = {
-            "total_frames": 0,
-            "recognized_frames": 0,
-            "buy_count": 0,
-            "total_recognize_ms": 0.0,
-        }
-
-        # 初始化子模块
-        logger.info("初始化视觉引擎...")
-        self._vision = VisionEngine(
-            server_url=self.config.ocr_server_url,
-            use_gpu=self.config.use_gpu,
-        )
-
-        logger.info("初始化鼠标驱动...")
-        self._driver = MouseDriver()
+        self._build_ui()
+        self._center(1100, 720)
 
     # ------------------------------------------------------------------
-    # 属性
+    # UI 构建
     # ------------------------------------------------------------------
 
-    @property
-    def is_running(self) -> bool:
-        """主循环是否正在运行。"""
-        return not self._stop_event.is_set()
+    def _build_ui(self) -> None:
+        """构建主界面布局。"""
+
+        # ── 顶部标题栏 ──────────────────────────────────────────────
+        title_bar = tk.Frame(self._root, bg=CLR_PANEL, pady=8)
+        title_bar.pack(fill="x")
+
+        tk.Label(
+            title_bar,
+            text="⚡  工作流自动化工具",
+            bg=CLR_PANEL, fg=CLR_ACCENT,
+            font=("Microsoft YaHei UI", 14, "bold"),
+        ).pack(side="left", padx=16)
+
+        tk.Label(
+            title_bar,
+            text="设计工作流 → 点击执行",
+            bg=CLR_PANEL, fg=CLR_SUBTEXT,
+            font=FONT_SMALL,
+        ).pack(side="left", padx=4)
+
+        # ── 主体区域（三列）────────────────────────────────────────
+        body = tk.Frame(self._root, bg=CLR_BG)
+        body.pack(fill="both", expand=True)
+
+        # 左：工具箱
+        self._toolbox = ToolboxPanel(body, on_add_step=self._on_add_step)
+        self._toolbox.pack(side="left", fill="y", padx=(8, 4), pady=8)
+
+        # 分隔线
+        tk.Frame(body, bg=CLR_BORDER, width=1).pack(side="left", fill="y", pady=8)
+
+        # 中：工作流画布
+        self._canvas = WorkflowCanvas(body, on_change=self._on_workflow_change)
+        self._canvas.pack(side="left", fill="both", expand=True, padx=4, pady=8)
+
+        # 分隔线
+        tk.Frame(body, bg=CLR_BORDER, width=1).pack(side="left", fill="y", pady=8)
+
+        # 右：控制面板
+        self._ctrl_panel = self._build_ctrl_panel(body)
+        self._ctrl_panel.pack(side="left", fill="y", padx=(4, 8), pady=8)
+
+        # ── 底部日志区 ──────────────────────────────────────────────
+        tk.Frame(self._root, bg=CLR_BORDER, height=1).pack(fill="x")
+        self._log_panel = LogPanel(self._root)
+        self._log_panel.pack(fill="x")
+
+    def _build_ctrl_panel(self, parent: tk.Widget) -> tk.Frame:
+        """构建右侧控制面板（执行/停止按钮 + 状态显示）。"""
+        panel = tk.Frame(parent, bg=CLR_PANEL, padx=12, pady=12, width=160)
+        panel.pack_propagate(False)
+
+        tk.Label(
+            panel, text="控 制", bg=CLR_PANEL, fg=CLR_ACCENT,
+            font=FONT_TITLE,
+        ).pack(fill="x", pady=(0, 12))
+
+        # 执行按钮
+        self._btn_run = tk.Button(
+            panel,
+            text="▶  执 行",
+            bg=CLR_GREEN,
+            fg="#ffffff",
+            activebackground="#155c2e",
+            activeforeground="#ffffff",
+            relief="flat",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            cursor="hand2",
+            pady=8,
+            command=self._on_run,
+        )
+        self._btn_run.pack(fill="x", pady=4)
+
+        # 停止按钮
+        self._btn_stop = tk.Button(
+            panel,
+            text="■  停 止",
+            bg=CLR_CARD,
+            fg=CLR_RED,
+            activebackground=CLR_RED,
+            activeforeground="#fff",
+            relief="flat",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            cursor="hand2",
+            pady=8,
+            state="disabled",
+            command=self._on_stop,
+        )
+        self._btn_stop.pack(fill="x", pady=4)
+
+        # 分隔线
+        tk.Frame(panel, bg=CLR_BORDER, height=1).pack(fill="x", pady=12)
+
+        # 状态标签
+        tk.Label(
+            panel, text="状态", bg=CLR_PANEL, fg=CLR_SUBTEXT,
+            font=FONT_SMALL,
+        ).pack(anchor="w")
+
+        self._status_lbl = tk.Label(
+            panel,
+            text="就绪",
+            bg=CLR_PANEL,
+            fg=CLR_TEXT,
+            font=FONT_NORMAL,
+            anchor="w",
+            wraplength=140,
+            justify="left",
+        )
+        self._status_lbl.pack(fill="x", pady=(2, 12))
+
+        # 步骤计数
+        tk.Label(
+            panel, text="步骤数", bg=CLR_PANEL, fg=CLR_SUBTEXT,
+            font=FONT_SMALL,
+        ).pack(anchor="w")
+
+        self._step_count_lbl = tk.Label(
+            panel, text="0",
+            bg=CLR_PANEL, fg=CLR_TEXT,
+            font=FONT_NORMAL, anchor="w",
+        )
+        self._step_count_lbl.pack(fill="x", pady=(2, 0))
+
+        return panel
 
     # ------------------------------------------------------------------
-    # 内部方法
+    # 工具箱回调
     # ------------------------------------------------------------------
 
-    def _get_mode_info(self) -> str:
-        """返回当前运行模式描述字符串。"""
-        if self.config.ocr_server_url:
-            return f"服务模式 ({self.config.ocr_server_url})"
-        return f"本地模式 ({'GPU' if self.config.use_gpu else 'CPU'})"
-
-    def _should_buy(self, price: int) -> bool:
-        """
-        判断是否应该触发购买。
-
-        Args:
-            price: 当前识别价格
-
-        Returns:
-            True 表示应触发购买
-        """
-        if price <= 0:
-            return False
-        if price > self.config.target_price:
-            return False
-        if self.config.max_buy_count > 0:
-            if self._stats["buy_count"] >= self.config.max_buy_count:
-                logger.info(
-                    "已达最大购买次数 %d，不再触发", self.config.max_buy_count
-                )
-                return False
-        return True
-
-    def _do_buy(self, price: int) -> None:
-        """
-        执行购买操作。
-
-        Args:
-            price: 触发购买时的识别价格
-        """
-        self._stats["buy_count"] += 1
-        logger.info(
-            "★ 触发购买！识别价格: %d <= 目标价格: %d（第 %d 次）",
-            price,
-            self.config.target_price,
-            self._stats["buy_count"],
-        )
-        print(
-            f"[SniperBot] ★ 触发购买！识别价格: {price} <= "
-            f"目标价格: {self.config.target_price}"
-            f"（第 {self._stats['buy_count']} 次）"
-        )
-
-        self._driver.move_and_click(
-            self.config.buy_button_pos[0],
-            self.config.buy_button_pos[1],
-        )
-
-        # 冷却等待，防止重复触发
-        self._stop_event.wait(timeout=self.config.buy_cooldown)
-
-    def _print_stats(self) -> None:
-        """打印运行统计摘要。"""
-        s = self._stats
-        avg_ms = (
-            s["total_recognize_ms"] / s["recognized_frames"]
-            if s["recognized_frames"] > 0
-            else 0
-        )
-        print("\n" + "=" * 60)
-        print("  运行统计摘要")
-        print("=" * 60)
-        print(f"  总帧数:       {s['total_frames']}")
-        print(f"  有效识别帧:   {s['recognized_frames']}")
-        print(f"  触发购买次数: {s['buy_count']}")
-        print(f"  平均识别耗时: {avg_ms:.0f} ms")
-        print("=" * 60)
+    def _on_add_step(self, step_type: StepType) -> None:
+        """工具箱点击 → 追加默认步骤到画布。"""
+        step = make_step(step_type)
+        self._canvas.add_step(step)
+        self._log(f"已添加步骤：{step.display_name()}")
 
     # ------------------------------------------------------------------
-    # 公开接口
+    # 工作流变化回调
     # ------------------------------------------------------------------
 
-    def start_loop(self) -> None:
-        """
-        启动主监控循环（阻塞调用）。
+    def _on_workflow_change(self) -> None:
+        """步骤列表变化时更新步骤计数。"""
+        count = len(self._canvas.steps)
+        self._step_count_lbl.config(text=str(count))
 
-        以目标帧率运行，持续截屏识别价格。
-        当价格满足触发条件时，自动执行购买点击。
-        通过 stop() 方法或 _stop_event 安全终止。
-        """
-        self._stop_event.clear()
-        cfg = self.config
-        frame_interval = 1.0 / cfg.target_fps
-        consecutive_errors = 0
+    # ------------------------------------------------------------------
+    # 执行 / 停止
+    # ------------------------------------------------------------------
 
-        logger.info(
-            "主循环已启动，目标帧率: %.1f FPS，模式: %s",
-            cfg.target_fps,
-            self._get_mode_info(),
-        )
-        print(f"[SniperBot] 主循环已启动，目标帧率: {cfg.target_fps} FPS")
+    def _on_run(self) -> None:
+        """点击执行按钮。"""
+        steps = self._canvas.steps
+        if not steps:
+            messagebox.showwarning("工作流为空", "请先在左侧工具箱添加步骤", parent=self._root)
+            return
 
-        while not self._stop_event.is_set():
-            t_start = time.perf_counter()
+        # 检查是否有未配置的步骤
+        unconfigured = [
+            f"步骤 {i+1}: {s.display_name()}"
+            for i, s in enumerate(steps)
+            if not s.is_configured()
+        ]
+        if unconfigured:
+            msg = "以下步骤尚未配置，请先编辑：\n" + "\n".join(unconfigured)
+            messagebox.showwarning("步骤未配置", msg, parent=self._root)
+            return
 
+        # 懒加载后端（使用本地 OCR 服务，避免每次重新加载模型）
+        if self._ocr_backend is None:
+            self._log("正在连接 OCR 服务 (http://127.0.0.1:5000)...")
             try:
-                # ===== 截屏并识别价格 =====
-                current_price = self._vision.capture_and_recognize(
-                    cfg.price_region
-                )
-                recognize_ms = (time.perf_counter() - t_start) * 1000
-
-                # 更新统计
-                self._stats["total_frames"] += 1
-                if current_price > 0:
-                    self._stats["recognized_frames"] += 1
-                    self._stats["total_recognize_ms"] += recognize_ms
-                    logger.debug(
-                        "当前价格: %d（耗时: %.0f ms）", current_price, recognize_ms
-                    )
-                    print(
-                        f"[SniperBot] 当前识别价格: {current_price}"
-                        f"（耗时: {recognize_ms:.0f} ms）"
-                    )
-
-                # ===== 购买判定 =====
-                if self._should_buy(current_price):
-                    self._do_buy(current_price)
-
-                    # 达到最大购买次数后自动退出
-                    if (
-                        cfg.max_buy_count > 0
-                        and self._stats["buy_count"] >= cfg.max_buy_count
-                    ):
-                        logger.info("已完成全部购买任务，自动退出")
-                        self._stop_event.set()
-                        break
-
-                # 重置连续错误计数
-                consecutive_errors = 0
-
+                self._ocr_backend = OcrBackend(server_url="http://127.0.0.1:5000")
             except Exception as exc:
-                consecutive_errors += 1
-                logger.error(
-                    "主循环单帧异常（连续 %d 次）: %s",
-                    consecutive_errors,
-                    exc,
-                )
-                print(f"[SniperBot] 主循环单帧异常: {exc}")
+                self._log(f"✗ OCR 后端初始化失败：{exc}")
+                messagebox.showerror("初始化失败", f"OCR 后端初始化失败：{exc}", parent=self._root)
+                return
 
-                if consecutive_errors >= cfg.max_consecutive_errors:
-                    logger.critical(
-                        "连续异常次数达到阈值 %d，自动退出",
-                        cfg.max_consecutive_errors,
-                    )
-                    print(
-                        f"[SniperBot] 连续异常 {cfg.max_consecutive_errors} 次，"
-                        "自动退出"
-                    )
-                    self._stop_event.set()
-                    break
+        if self._mouse_driver is None:
+            self._mouse_driver = MouseDriver()
 
-            # ===== 帧率控制 =====
-            elapsed = time.perf_counter() - t_start
-            remaining = frame_interval - elapsed
-            if remaining > 0:
-                # 使用 Event.wait 代替 time.sleep，可被 stop() 立即中断
-                self._stop_event.wait(timeout=remaining)
+        # 创建并启动引擎
+        self._engine = WorkflowEngine(
+            steps=steps,
+            ocr_backend=self._ocr_backend,
+            mouse_driver=self._mouse_driver,
+            on_log=self._on_engine_log,
+            on_step=self._on_engine_step,
+            on_done=self._on_engine_done,
+        )
 
-        logger.info("主循环已安全退出")
-        print("[SniperBot] 主循环已安全退出")
-        self._print_stats()
+        self._set_running(True)
+        self._canvas.clear_active()
+        self._engine.start()
 
-    def stop(self) -> None:
-        """
-        安全停止主监控循环。
+    def _on_stop(self) -> None:
+        """点击停止按钮。"""
+        if self._engine and self._engine.is_running:
+            self._engine.stop()
 
-        设置停止事件，主循环将在当前帧结束后立即退出（无需等待 sleep 结束）。
-        """
-        logger.info("收到停止信号，正在退出...")
-        print("[SniperBot] 收到停止信号，正在退出...")
-        self._stop_event.set()
+    # ------------------------------------------------------------------
+    # 引擎回调（后台线程调用，需通过 after 切回主线程）
+    # ------------------------------------------------------------------
+
+    def _on_engine_log(self, msg: str) -> None:
+        self._root.after(0, self._log, msg)
+
+    def _on_engine_step(self, index: int) -> None:
+        self._root.after(0, self._canvas.set_active, index)
+        self._root.after(0, self._status_lbl.config, {"text": f"执行步骤 {index + 1}"})
+
+    def _on_engine_done(self, reason: str) -> None:
+        self._root.after(0, self._handle_done, reason)
+
+    def _handle_done(self, reason: str) -> None:
+        self._canvas.clear_active()
+        self._set_running(False)
+
+        reason_map = {
+            "done":      ("✓ 工作流执行完成", CLR_GREEN),
+            "stopped":   ("■ 工作流已停止",   CLR_TEXT),
+            "cancelled": ("■ 已手动取消",     CLR_TEXT),
+            "error":     ("✗ 执行出错",       CLR_RED),
+        }
+        text, color = reason_map.get(reason, (f"结束: {reason}", CLR_TEXT))
+        self._status_lbl.config(text=text, fg=color)
+        self._log(text)
+
+    # ------------------------------------------------------------------
+    # UI 状态切换
+    # ------------------------------------------------------------------
+
+    def _set_running(self, running: bool) -> None:
+        if running:
+            self._btn_run.config(state="disabled", bg=CLR_CARD, fg=CLR_SUBTEXT)
+            self._btn_stop.config(state="normal")
+            self._status_lbl.config(text="运行中...", fg=CLR_GREEN)
+        else:
+            self._btn_run.config(state="normal", bg=CLR_GREEN, fg="#ffffff")
+            self._btn_stop.config(state="disabled")
+
+    # ------------------------------------------------------------------
+    # 日志
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str) -> None:
+        self._log_panel.append(msg)
+        logger.info(msg)
+
+    # ------------------------------------------------------------------
+    # 窗口管理
+    # ------------------------------------------------------------------
+
+    def _on_close(self) -> None:
+        if self._engine and self._engine.is_running:
+            if not messagebox.askyesno("确认退出", "工作流正在运行，确认退出？", parent=self._root):
+                return
+            self._engine.stop()
+        if self._mouse_driver:
+            self._mouse_driver.close()
+        self._root.destroy()
+
+    def _center(self, w: int, h: int) -> None:
+        self._root.update_idletasks()
+        sw = self._root.winfo_screenwidth()
+        sh = self._root.winfo_screenheight()
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self._root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def run(self) -> None:
+        self._root.mainloop()
 
 
-# ------------------------------------------------------------------
-# 程序入口
-# ------------------------------------------------------------------
+# ======================================================================
+# 入口
+# ======================================================================
 
 if __name__ == "__main__":
-    # 在此处修改配置参数
-    config = BotConfig(
-        target_price=150_000,
-        price_region={"top": 400, "left": 800, "width": 200, "height": 50},
-        buy_button_pos=(960, 600),
-        target_fps=2.0,
-        ocr_server_url="http://localhost:5000",   # 例如 "http://localhost:5000"
-        use_gpu=True,
-        buy_cooldown=2.0,
-        max_buy_count=0,       # 0 = 不限制
-        max_consecutive_errors=10,
-    )
-
-    bot = SniperBot(config)
-
-    def on_press(key):
-        """键盘热键回调：F9 安全退出。"""
-        if key == keyboard.Key.f9:
-            print("\n[热键] 检测到 F9 按下，正在安全退出...")
-            bot.stop()
-            return False  # 停止 pynput 监听器线程
-
-    # 启动后台键盘监听线程
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
-
-    # 打印启动信息
-    print("=" * 60)
-    print("  极速价格识别与自动点击系统 - 已启动")
-    print(f"  识别引擎: TrOCR（微软 Vision Transformer）")
-    print(f"  运行模式: {bot._get_mode_info()}")
-    print("=" * 60)
-    print(f"  目标价格:   <= {config.target_price}")
-    print(f"  识别区域:   {config.price_region}")
-    print(f"  购买按钮:   {config.buy_button_pos}")
-    print(f"  目标帧率:   {config.target_fps} FPS")
-    print(f"  购买冷却:   {config.buy_cooldown} 秒")
-    print(f"  最大购买:   {'不限' if config.max_buy_count == 0 else config.max_buy_count} 次")
-    print(f"  退出热键:   F9")
-    print("=" * 60)
-
-    # 启动主监控循环（阻塞主线程）
-    bot.start_loop()
-
-    print("[主程序] 脚本已完全退出")
+    app = WorkflowApp()
+    app.run()

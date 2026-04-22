@@ -2,8 +2,8 @@ mss
 opencv-python
 numpy
 pynput
-transformers
-torch
+paddleocr
+paddlepaddle-gpu==3.0.0
 Pillow
 flask
 requests

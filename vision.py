@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-视觉引擎模块 - TrOCR 版本
+视觉引擎模块 - PaddleOCR 版本
 
-使用微软 TrOCR (Vision Transformer) 进行高精度数字识别。
-支持本地模式（直接加载模型）和服务模式（HTTP 调用 ocr_server.py）。
+使用 PaddleOCR（PP-OCRv5）进行高精度数字识别。
+相比传统 OCR，PaddleOCR 对小区域纯数字场景识别准确率更高，速度更快。
+
+支持本地模式（直接调用 PaddleOCR）和服务模式（HTTP 调用 ocr_server.py）。
 
 优化点：
-- 图像预处理增强（灰度化、二值化、降噪、放大）提升 OCR 准确率
+- 使用 PaddleOCR 英文数字模型（en），专为数字/字母场景优化
+- 关闭方向分类（use_angle_cls=False），减少不必要推理
 - 服务模式增加重试机制与超时控制
 - 统一返回值语义：识别失败统一返回 -1
 - 日志使用 logging 模块，支持调试级别控制
@@ -29,22 +32,23 @@ logger = logging.getLogger(__name__)
 
 class VisionEngine:
     """
-    视觉引擎 - 基于 TrOCR 的高精度数字识别
+    视觉引擎 - 基于 PaddleOCR 的高精度数字识别
 
     支持两种运行模式：
-    1. 本地模式（默认）：直接加载 TrOCR 模型到 GPU/CPU
+    1. 本地模式（默认）：直接调用 PaddleOCR 模型（GPU/CPU）
     2. 服务模式：通过 HTTP 调用 ocr_server.py 的 API
 
-    图像预处理流程（提升 OCR 准确率）：
-        原图 → 灰度化 → 放大 2x → 自适应二值化 → 降噪
+    PaddleOCR 配置说明：
+        - lang='en'：英文数字模型，专为数字/字母场景优化
+        - use_angle_cls=False：关闭方向分类，加快推理速度
+        - use_gpu：是否使用 GPU 加速
+        - show_log=False：关闭 PaddleOCR 内部日志，避免刷屏
     """
 
     # 服务模式请求超时（秒）
     _REQUEST_TIMEOUT = 10
     # 服务模式最大重试次数
     _MAX_RETRIES = 3
-    # 图像放大倍数（提升小字体识别率）
-    _SCALE_FACTOR = 2.0
 
     def __init__(
         self,
@@ -105,51 +109,32 @@ class VisionEngine:
             logger.warning("无法连接 OCR 服务: %s，将在调用时重试", exc)
 
     def _init_local_mode(self, use_gpu: bool) -> None:
-        """初始化本地 TrOCR 模型。"""
-        logger.info("正在初始化 TrOCR 引擎（首次运行需下载模型约 1GB）...")
-        print("[VisionEngine] 正在初始化 TrOCR 引擎（首次运行需下载模型约 1GB）...")
+        """初始化本地 PaddleOCR 引擎。"""
+        logger.info("正在初始化 PaddleOCR 引擎...")
+        print("[VisionEngine] 正在初始化 PaddleOCR 引擎...")
         t_start = time.perf_counter()
 
-        import torch
-        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-        from PIL import Image
+        from paddleocr import PaddleOCR
 
-        self._Image = Image
-
-        # 选择计算设备
-        if use_gpu and torch.cuda.is_available():
-            self._device = torch.device("cuda")
-            gpu_name = torch.cuda.get_device_name(0)
-            logger.info("使用 GPU: %s", gpu_name)
-            print(f"[VisionEngine] 使用 GPU: {gpu_name}")
-        else:
-            self._device = torch.device("cpu")
-            if use_gpu:
-                logger.warning("GPU 不可用，回退到 CPU 模式")
-                print("[VisionEngine] GPU 不可用，回退到 CPU 模式")
-            else:
-                logger.info("使用 CPU 模式")
-                print("[VisionEngine] 使用 CPU 模式")
-
-        model_name = "microsoft/trocr-base-printed"
-        logger.info("加载模型: %s", model_name)
-        print(f"[VisionEngine] 加载模型: {model_name}")
-
-        self._processor = TrOCRProcessor.from_pretrained(model_name)
-        self._model = VisionEncoderDecoderModel.from_pretrained(model_name)
-        self._model.to(self._device)
-        self._model.eval()
+        # PP-OCRv5 模型配置：
+        #   text_detection_model_name:    PP-OCRv5_server_det  （高精度检测）
+        #   text_recognition_model_name:  en_PP-OCRv5_mobile_rec（英文数字识别）
+        # use_textline_orientation=False 关闭行方向分类，加快推理速度
+        # enable_mkldnn=False 禁用 oneDNN，避免兼容性问题（CPU 模式下有效）
+        # device="gpu"/"cpu" 为 PaddleOCR 3.x 新版设备参数
+        self._ocr = PaddleOCR(
+            text_detection_model_name="PP-OCRv5_server_det",
+            text_recognition_model_name="en_PP-OCRv5_mobile_rec",
+            use_textline_orientation=False,
+            device="gpu" if use_gpu else "cpu",
+            enable_mkldnn=False,
+        )
 
         t_elapsed = time.perf_counter() - t_start
-        logger.info("TrOCR 引擎初始化完成，耗时 %.2f 秒", t_elapsed)
-        print(f"[VisionEngine] TrOCR 引擎初始化完成")
-        print(f"  设备: {self._device}")
+        logger.info("PaddleOCR 引擎初始化完成，耗时 %.2f 秒", t_elapsed)
+        print(f"[VisionEngine] PaddleOCR 引擎初始化完成")
+        print(f"  模式: {'GPU' if use_gpu else 'CPU'}")
         print(f"  初始化耗时: {t_elapsed:.2f} 秒")
-
-        if self._device.type == "cuda":
-            import torch
-            mem = torch.cuda.memory_allocated() / 1024 / 1024
-            print(f"  GPU 显存占用: {mem:.0f} MB")
 
     # ------------------------------------------------------------------
     # 图像预处理
@@ -157,47 +142,50 @@ class VisionEngine:
 
     def _preprocess(self, img_bgr: np.ndarray) -> np.ndarray:
         """
-        对截图进行预处理，提升 OCR 识别准确率。
+        图像预处理：自动检测深色背景并反色，放大至目标高度，锐化文字边缘。
 
         处理流程：
-            1. 放大图像（小字体在高分辨率下识别更准）
-            2. 转灰度
-            3. 自适应二值化（应对不均匀光照）
-            4. 形态学降噪（去除细小噪点）
-            5. 转回 BGR（TrOCR 输入需要 RGB，后续在 _recognize_local 中转换）
+            1. 若图像平均亮度 < 128，判定为深色背景，执行反色
+               （深色背景白色文字 → 白底黑字，提升 PaddleOCR 检测率）
+            2. 若图像高度 < 128px，按比例放大至 128px（最大放大 8x）
+               （小图放大后识别率更高，128px 是 PaddleOCR 检测模型的推荐最小高度）
+            3. 放大后对图像做 Unsharp Mask 锐化
+               （放大引入模糊，锐化恢复文字边缘清晰度）
 
         Args:
-            img_bgr: BGR 格式的原始截图
+            img_bgr: BGR 格式原始图像
 
         Returns:
             预处理后的 BGR 图像
         """
-        # 1. 放大
+        # 1. 深色背景检测与反色
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        mean_brightness = float(gray.mean())
+        if mean_brightness < 128:
+            img_bgr = cv2.bitwise_not(img_bgr)
+            if self._debug:
+                logger.debug("检测到深色背景（亮度=%.1f），已执行反色", mean_brightness)
+
+        # 2. 小图放大（目标高度 128px，最大放大 8x）
         h, w = img_bgr.shape[:2]
-        img_scaled = cv2.resize(
-            img_bgr,
-            (int(w * self._SCALE_FACTOR), int(h * self._SCALE_FACTOR)),
-            interpolation=cv2.INTER_CUBIC,
-        )
+        if h < 128:
+            scale = min(128.0 / h, 8.0)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img_bgr = cv2.resize(
+                img_bgr,
+                (new_w, new_h),
+                interpolation=cv2.INTER_CUBIC,
+            )
+            if self._debug:
+                logger.debug("小图放大 %.1fx: %dx%d → %dx%d", scale, w, h, new_w, new_h)
 
-        # 2. 灰度化
-        gray = cv2.cvtColor(img_scaled, cv2.COLOR_BGR2GRAY)
+            # 3. Unsharp Mask 锐化：增强放大后的文字边缘
+            # 原理：锐化 = 原图 + α × (原图 - 高斯模糊)
+            blurred = cv2.GaussianBlur(img_bgr, (0, 0), sigmaX=1.5)
+            img_bgr = cv2.addWeighted(img_bgr, 1.8, blurred, -0.8, 0)
 
-        # 3. 自适应二值化（blockSize=15, C=8 适合数字场景）
-        binary = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=15,
-            C=8,
-        )
-
-        # 4. 形态学开运算降噪（去除孤立噪点）
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        denoised = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-
-        # 5. 转回 BGR（保持接口一致，_recognize_local 内部再转 RGB）
-        return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+        return img_bgr
 
     # ------------------------------------------------------------------
     # 识别核心
@@ -205,33 +193,43 @@ class VisionEngine:
 
     def _recognize_local(self, img_bgr: np.ndarray) -> str:
         """
-        本地模式：使用 TrOCR 模型识别图片中的文字。
+        本地模式：使用 PaddleOCR 识别图片中的文字。
 
         Args:
             img_bgr: BGR 格式的 numpy 数组图片
 
         Returns:
-            识别出的原始文本字符串
+            识别出的原始文本字符串（多行结果以空格拼接）
         """
-        import torch
+        # 预处理：自动反色 + 小图放大
+        img_bgr = self._preprocess(img_bgr)
 
-        img_preprocessed = self._preprocess(img_bgr)
-        img_rgb = cv2.cvtColor(img_preprocessed, cv2.COLOR_BGR2RGB)
-        pil_image = self._Image.fromarray(img_rgb)
+        # PaddleOCR 3.x: ocr() 等同于 predict()，返回 list[OCRResult]
+        # OCRResult 是类字典对象，文本在 rec_texts，置信度在 rec_scores
+        result = self._ocr.ocr(img_bgr)
 
-        pixel_values = self._processor(
-            images=pil_image,
-            return_tensors="pt",
-        ).pixel_values.to(self._device)
+        if not result:
+            return ""
 
-        with torch.no_grad():
-            generated_ids = self._model.generate(pixel_values)
+        ocr_res = result[0]  # 第一张图的结果，OCRResult 对象
+        rec_texts = ocr_res.get("rec_texts", [])
+        rec_scores = ocr_res.get("rec_scores", [])
 
-        text = self._processor.batch_decode(
-            generated_ids, skip_special_tokens=True
-        )[0]
+        if not rec_texts:
+            return ""
 
-        return text.strip()
+        # 按置信度过滤并拼接所有识别到的文本
+        texts = []
+        for text, confidence in zip(rec_texts, rec_scores):
+            if confidence >= 0.5:  # 置信度低于 50% 的结果丢弃
+                texts.append(text)
+                if self._debug:
+                    logger.debug(
+                        "PaddleOCR 识别: '%s' (置信度: %.2f)", text, confidence
+                    )
+                    print(f"[VisionEngine] 识别片段: '{text}' (置信度: {confidence:.2f})")
+
+        return " ".join(texts)
 
     def _recognize_via_server(
         self, img_bgr: np.ndarray
@@ -245,8 +243,7 @@ class VisionEngine:
         Returns:
             (识别文本, 详细结果字典) 的元组；失败时返回 ("", {})
         """
-        img_preprocessed = self._preprocess(img_bgr)
-        _, buffer = cv2.imencode(".png", img_preprocessed)
+        _, buffer = cv2.imencode(".png", img_bgr)
         img_base64 = base64.b64encode(buffer).decode("utf-8")
 
         last_exc: Optional[Exception] = None
@@ -319,6 +316,59 @@ class VisionEngine:
         except ValueError:
             logger.warning("数字转换失败: '%s'", number_str)
             return -1
+
+    def extract_price(self, text: str) -> float:
+        """
+        从 OCR 识别文本中提取价格（支持小数点）。
+
+        策略：
+            1. 优先匹配带小数点的数字，如 "1,234.56" → 1234.56
+            2. 去除千位分隔符（逗号），保留小数点
+            3. 若无小数点，返回整数值（float 类型）
+
+        例如：
+            "¥ 1,234.56" → 1234.56
+            "150,000"    → 150000.0
+            "99.9"       → 99.9
+
+        Args:
+            text: OCR 识别的原始文本
+
+        Returns:
+            提取的价格浮点数；文本为空或无数字时返回 -1.0
+        """
+        if not text:
+            return -1.0
+
+        if self._debug:
+            logger.debug("OCR 原始文本（价格提取）: '%s'", text)
+
+        # 先尝试匹配带小数点的完整数字（含千位逗号）
+        # 例如 "1,234.56" 或 "1234.56"
+        match = re.search(r"[\d,]+\.\d+", text)
+        if match:
+            num_str = match.group().replace(",", "")
+            try:
+                val = float(num_str)
+                if self._debug:
+                    logger.debug("提取价格（含小数）: %s → %.4f", match.group(), val)
+                return val
+            except ValueError:
+                pass
+
+        # 无小数点：拼接所有数字片段（去除逗号分隔符）
+        # 例如 "150,000" → 150000
+        clean = re.sub(r"[^\d]", "", text)
+        if not clean:
+            return -1.0
+        try:
+            val = float(clean)
+            if self._debug:
+                logger.debug("提取价格（整数）: '%s' → %.0f", clean, val)
+            return val
+        except ValueError:
+            logger.warning("价格转换失败: '%s'", clean)
+            return -1.0
 
     # ------------------------------------------------------------------
     # 公开接口
